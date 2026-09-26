@@ -1,0 +1,164 @@
+# ==============================================================================
+# ModuleTwo - Self Consumption (local / offline, no cloud dependency)
+# ==============================================================================
+# Home Assistant automation that drives a MyGrid ModuleTwo battery (controlled
+# via MQTT-backed entities) to follow a self-consumption strategy: charge only
+# with solar surplus that would otherwise be exported to the grid, discharge to
+# cover the remaining household load, within configured state-of-charge (SoC)
+# limits.
+#
+# MyGrid Smart Control already offers a comparable "solar" self-consumption
+# strategy out of the box, so this example isn't meant to replace that for a
+# single ModuleTwo running on its own — use Smart Control for that. This is
+# useful instead when you specifically need:
+#   - Local control that keeps working if internet/cloud connectivity drops
+#     (Home Assistant control, once connected, runs entirely on your LAN).
+#   - Coordination with another battery or device Smart Control can't see —
+#     e.g. running ModuleTwo alongside a non-MyGrid battery, or gating it on
+#     another system's state (a heat pump, an EV charger, etc., as in the
+#     other examples in this folder).
+#
+# Runs every 5 seconds and recalculates a single signed-watt setpoint:
+#   positive = charge, negative = discharge.
+#
+# --------------------------------------------------------------------------
+# Sensors and entities used
+# --------------------------------------------------------------------------
+# sensor.voltbridge_089272ab025c_actual_power
+#   Grid power reading from the Voltbridge inverter bridge. Sign convention:
+#   negative = export to grid (surplus), positive = import from grid.
+#   Preferred source when available; some installs report this in kW instead
+#   of W, so a scale check (abs < 10 => multiply by 1000) is applied.
+#
+# sensor.p1_meter_power
+#   Fallback grid power reading from the P1 smart-meter dongle, used only when
+#   the Voltbridge sensor is unavailable. Same kW/W scale check applied.
+#
+# sensor.kwh_meter_3_phase_production_power
+#   Live solar production power (W) from the 3-phase production meter. Used as
+#   a hard gate: charging is never allowed unless this is above ~100 W.
+#
+#   This sensor is REQUIRED if your setup includes more than one battery
+#   sharing the same grid meter (e.g. a Marstek unit alongside ModuleTwo).
+#   Without it, ModuleTwo could misread another battery's discharge as solar
+#   surplus and start charging from it (battery-to-battery charging, which
+#   wastes round-trip efficiency and can happen even at night) — because the
+#   grid-power reading (grid_w) reflects everything feeding the grid, and the
+#   formula below only removes ModuleTwo's OWN power from that reading, not
+#   any other battery's contribution.
+#
+#   If ModuleTwo is the ONLY battery in your setup, that specific failure
+#   mode doesn't apply, so this sensor is technically OPTIONAL — but it's
+#   still recommended as a general safety guard: it protects against noise or
+#   lag in the grid reading (a brief negative blip from an unrelated device
+#   switching off, phase imbalance, a stale sensor value) being misread as a
+#   surplus, and it enforces "never charge from grid" as a hard rule rather
+#   than relying purely on the grid-power math being correct at every
+#   instant. If you omit it in a single-battery setup, remove the
+#   `solar_present` variable and the guard that uses it (search for
+#   "solar_present" below).
+#
+# sensor.moduletwo_1cc3ab08f7fc_state_of_charge
+#   ModuleTwo's own state of charge (%). Used to enforce min/max SoC limits
+#   (12% floor, 99% ceiling) so the automation never over- or under-charges
+#   the battery.
+#
+# sensor.moduletwo_1cc3ab08f7fc_power
+#   ModuleTwo's actual measured power (W) right now. Used to back out
+#   ModuleTwo's own contribution from the grid reading, isolating the
+#   household's residual load/surplus that ModuleTwo still needs to cover.
+#
+# number.moduletwo_1cc3ab08f7fc_power_setpoint
+#   The control entity: the signed-watt command written to ModuleTwo via its
+#   MQTT integration. This is both read (to know the current setpoint, for
+#   rate-limiting) and written (the actual control action).
+# ==============================================================================
+
+alias: ModuleTwo - Self Consumption (offline/local)
+description: >-
+  Charges only with solar surplus that would otherwise be exported to the
+  grid, discharges to cover the remaining household load, within the
+  configured SoC limits. Runs entirely locally and can coordinate with other
+  devices or batteries that MyGrid Smart Control can't see.
+triggers:
+  - seconds: /5
+    trigger: time_pattern
+conditions:
+  - condition: template
+    value_template: >
+      {{ states('sensor.voltbridge_089272ab025c_actual_power') not in
+      ['unknown', 'unavailable', 'none']
+         or states('sensor.p1_meter_power') not in ['unknown', 'unavailable', 'none'] }}
+  - condition: template
+    value_template: >
+      {{ states('sensor.moduletwo_1cc3ab08f7fc_state_of_charge') not in
+      ['unknown', 'unavailable', 'none'] }}
+  - condition: template
+    value_template: >
+      {{ states('sensor.moduletwo_1cc3ab08f7fc_power') not in ['unknown',
+      'unavailable', 'none'] }}
+actions:
+  - action: number.set_value
+    target:
+      entity_id: number.moduletwo_1cc3ab08f7fc_power_setpoint
+    data:
+      # --------------------------------------------------------------------
+      # Control algorithm (feedback loop, recalculated every cycle):
+      #   1. Read grid power (grid_w), preferring Voltbridge, falling back
+      #      to P1.
+      #   2. Back out ModuleTwo's own current power to isolate the residual
+      #      household load/surplus (house_load).
+      #   3. Derive a raw target: discharge to cover a deficit, charge with a
+      #      surplus (exact_target = -house_load), clamped to hardware
+      #      limits.
+      #   4. Apply safety gates: SoC ceiling/floor, and never charge without
+      #      solar production.
+      #   5. Rate-limit the step toward the target (faster ramp-down, slower
+      #      ramp-up) to avoid abrupt power swings.
+      # --------------------------------------------------------------------
+      value: |-
+        {% set vb_state = states('sensor.voltbridge_089272ab025c_actual_power') %}
+        {% set p1_state = states('sensor.p1_meter_power') %}
+        {% if vb_state not in ['unknown', 'unavailable', 'none'] %}
+          {% set val = vb_state | float(0) %}
+          {% set grid_w = (val * 1000) if (val | abs < 10) else val %}
+        {% elif p1_state not in ['unknown', 'unavailable', 'none'] %}
+          {% set val = p1_state | float(0) %}
+          {% set grid_w = (val * 1000) if (val | abs < 10) else val %}
+        {% else %}
+          {% set grid_w = 0 %}
+        {% endif %}
+        {% set soc = states('sensor.moduletwo_1cc3ab08f7fc_state_of_charge') | float(50) %}
+        {% set current_setpoint = states('number.moduletwo_1cc3ab08f7fc_power_setpoint') | float(0) %}
+        {% set current_power = states('sensor.moduletwo_1cc3ab08f7fc_power') | float(0) %}
+        {% set solar_w = states('sensor.kwh_meter_3_phase_production_power') | float(0) %}
+        {% set solar_present = solar_w > 100 %}
+        {% set min_soc = 12 %}
+        {% set max_soc = 99 %}
+        {% set max_charge = 1200 %}
+        {% set max_discharge = -800 %}
+        {% set house_load = grid_w - current_power %}
+        {% if house_load | abs < 300 %}
+          {% set raw_target = 0 %}
+        {% else %}
+          {% set exact_target = -house_load %}
+          {% set raw_target = [ [ exact_target, max_charge ] | min, max_discharge ] | max %}
+          {% if soc >= max_soc and raw_target > 0 %}
+            {% set raw_target = 0 %}
+          {% endif %}
+          {% if soc <= min_soc and raw_target < 0 %}
+            {% set raw_target = 0 %}
+          {% endif %}
+          {% if not solar_present and raw_target > 0 %}
+            {% set raw_target = 0 %}
+          {% endif %}
+        {% endif %}
+        {% set step_diff = raw_target - current_setpoint %}
+        {% if raw_target < current_setpoint %}
+          {% set max_step_up = 800 %}
+        {% else %}
+          {% set max_step_up = 300 %}
+        {% endif %}
+        {% set damped_target = current_setpoint + [ [ step_diff, max_step_up ] | min, -max_step_up ] | max %}
+        {{ damped_target | round(0) }}
+mode: single
